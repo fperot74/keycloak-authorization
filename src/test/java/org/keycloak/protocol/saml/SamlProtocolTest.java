@@ -8,8 +8,9 @@ import javax.ws.rs.core.Response;
 import java.io.IOException;
 import java.util.UUID;
 
-import static org.junit.Assert.*;
-import static org.mockito.Mockito.*;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNotNull;
+import static org.mockito.Mockito.when;
 
 public class SamlProtocolTest {
 
@@ -26,50 +27,50 @@ public class SamlProtocolTest {
     }
 
     @Test
-    public void testAuthenticatedNotAuthorized(){
+    public void testAuthenticatedNotAuthorized() {
         mh.setPolicy(mh.getUserPolicy());
-        Response r = protocol.authenticated(mh.getUserSession(),mh.getClientSession());
+        Response r = protocol.authenticated(mh.getAuthenticationSession(), mh.getUserSession(), mh.getClientSessionContext());
         assertNotNull(r);
         assertEquals(Response.Status.FORBIDDEN.getStatusCode(), r.getStatus());
     }
 
     @Test
-    public void testAuthenticatedAuthorized(){
+    public void testAuthenticatedAuthorized() {
         mh.setPolicy(mh.getUserPolicy());
         when(mh.getUser().getId()).thenReturn(UUID.randomUUID().toString());
-        Response r = protocol.authenticated(mh.getUserSession(),mh.getClientSession());
+        Response r = protocol.authenticated(mh.getAuthenticationSession(), mh.getUserSession(), mh.getClientSessionContext());
         assertNotNull(r);
         assertEquals(Response.Status.FOUND.getStatusCode(), r.getStatus());
     }
 
     @Test
-    public void testAuthenticatedGroupNotAuthorized(){
+    public void testAuthenticatedGroupNotAuthorized() {
         when(mh.getUser().getId()).thenReturn(UUID.randomUUID().toString());
         mh.setPolicy(mh.getGroupPolicy());
         mh.enableSamlGroupMapper();
-        Response r = protocol.authenticated(mh.getUserSession(),mh.getClientSession());
+        Response r = protocol.authenticated(mh.getAuthenticationSession(), mh.getUserSession(), mh.getClientSessionContext());
         assertNotNull(r);
         assertEquals(Response.Status.FORBIDDEN.getStatusCode(), r.getStatus());
     }
 
     @Test
-    public void testAuthenticatedGroupAuthorized(){
+    public void testAuthenticatedGroupAuthorized() {
         mh.setPolicy(mh.getGroupPolicy());
         mh.enableSamlGroupMapper();
         mh.setGroup();
         when(mh.getUser().getId()).thenReturn(UUID.randomUUID().toString());
-        Response r = protocol.authenticated(mh.getUserSession(),mh.getClientSession());
+        Response r = protocol.authenticated(mh.getAuthenticationSession(), mh.getUserSession(), mh.getClientSessionContext());
         assertNotNull(r);
         assertEquals(Response.Status.FOUND.getStatusCode(), r.getStatus());
     }
 
     @Test
-    public void testAuthenticatedGroupSingleMemberAuthorized(){
+    public void testAuthenticatedGroupSingleMemberAuthorized() {
         mh.setPolicy(mh.getGroupPolicy());
         mh.enableSamlGroupMapper();
         mh.setGroupSingleMember();
         when(mh.getUser().getId()).thenReturn(UUID.randomUUID().toString());
-        Response r = protocol.authenticated(mh.getUserSession(),mh.getClientSession());
+        Response r = protocol.authenticated(mh.getAuthenticationSession(), mh.getUserSession(), mh.getClientSessionContext());
         assertNotNull(r);
         assertEquals(Response.Status.FOUND.getStatusCode(), r.getStatus());
     }

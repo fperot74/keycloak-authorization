@@ -16,6 +16,7 @@
  */
 package org.keycloak.protocol.oidc;
 
+import io.cloudtrust.keycloak.exceptions.CtRuntimeException;
 import io.cloudtrust.keycloak.protocol.LocalAuthorizationService;
 import org.jboss.logging.Logger;
 import org.keycloak.OAuth2Constants;
@@ -29,6 +30,7 @@ import org.keycloak.events.EventBuilder;
 import org.keycloak.events.EventType;
 import org.keycloak.models.AuthenticatedClientSessionModel;
 import org.keycloak.models.ClientModel;
+import org.keycloak.models.ClientSessionContext;
 import org.keycloak.models.KeycloakSession;
 import org.keycloak.models.RealmModel;
 import org.keycloak.models.UserSessionModel;
@@ -176,16 +178,17 @@ public class OIDCLoginProtocol implements LoginProtocol {
 
 
     @Override
-    public Response authenticated(UserSessionModel userSession, AuthenticatedClientSessionModel clientSession) {
+    public Response authenticated(AuthenticationSessionModel authSession, UserSessionModel userSession, ClientSessionContext clientSessionCtx) {
+        AuthenticatedClientSessionModel clientSession= clientSessionCtx.getClientSession();
         ClientSessionCode<AuthenticatedClientSessionModel> accessCode = new ClientSessionCode<>(session, realm, clientSession);
 
-        String responseTypeParam = clientSession.getNote(OIDCLoginProtocol.RESPONSE_TYPE_PARAM);
-        String responseModeParam = clientSession.getNote(OIDCLoginProtocol.RESPONSE_MODE_PARAM);
+        String responseTypeParam = authSession.getClientNote(OIDCLoginProtocol.RESPONSE_TYPE_PARAM);
+        String responseModeParam = authSession.getClientNote(OIDCLoginProtocol.RESPONSE_MODE_PARAM);
         setupResponseTypeAndMode(responseTypeParam, responseModeParam);
 
-        String redirect = clientSession.getRedirectUri();
+        String redirect = authSession.getRedirectUri();
         OIDCRedirectUriBuilder redirectUri = OIDCRedirectUriBuilder.fromUri(redirect, responseMode);
-        String state = clientSession.getNote(OIDCLoginProtocol.STATE_PARAM);
+        String state = authSession.getClientNote(OIDCLoginProtocol.STATE_PARAM);
         logger.debugv("redirectAccessCode: state: {0}", state);
         if (state != null)
             redirectUri.addParam(OAuth2Constants.STATE, state);
@@ -202,11 +205,10 @@ public class OIDCLoginProtocol implements LoginProtocol {
         // Implicit or hybrid flow
         if (responseType.isImplicitOrHybridFlow()) {
             TokenManager tokenManager = new TokenManager();
-            TokenManager.AccessTokenResponseBuilder responseBuilder = tokenManager.responseBuilder(realm, clientSession.getClient(), event, session, userSession, clientSession)
+            TokenManager.AccessTokenResponseBuilder responseBuilder = tokenManager.responseBuilder(realm, clientSession.getClient(), event, session, userSession, clientSessionCtx)
                     .generateAccessToken();
 
             if (responseType.hasResponseType(OIDCResponseType.ID_TOKEN)) {
-
                 responseBuilder.generateIDToken();
 
                 if (responseType.hasResponseType(OIDCResponseType.TOKEN)) {
@@ -216,7 +218,6 @@ public class OIDCLoginProtocol implements LoginProtocol {
                 if (responseType.hasResponseType(OIDCResponseType.CODE)) {
                     responseBuilder.generateCodeHash(code);
                 }
-
             }
 
             AccessTokenResponse res = responseBuilder.build();
@@ -236,7 +237,7 @@ public class OIDCLoginProtocol implements LoginProtocol {
 
         /*Authorization block*/
         LocalAuthorizationService authorize = new LocalAuthorizationService(session, realm);
-        Response authResponse = authorize.isAuthorizedResponse(clientSession.getClient(), userSession, clientSession, accessCode, null);
+        Response authResponse = authorize.isAuthorizedResponse(clientSession.getClient(), userSession, clientSessionCtx, null);
         if (authResponse != null) {
             return authResponse;
         }
@@ -285,7 +286,7 @@ public class OIDCLoginProtocol implements LoginProtocol {
     @Override
     public Response frontchannelLogout(UserSessionModel userSession, AuthenticatedClientSessionModel clientSession) {
         // todo oidc redirect support
-        throw new RuntimeException("NOT IMPLEMENTED");
+        throw new CtRuntimeException("NOT IMPLEMENTED");
     }
 
     @Override
@@ -341,7 +342,7 @@ public class OIDCLoginProtocol implements LoginProtocol {
     @Override
     public boolean sendPushRevocationPolicyRequest(RealmModel realm, ClientModel resource, int notBefore, String managementUrl) {
         PushNotBeforeAction adminAction = new PushNotBeforeAction(TokenIdGenerator.generateId(), Time.currentTime() + 30, resource.getClientId(), notBefore);
-        String token = new TokenManager().encodeToken(session, realm, adminAction);
+        String token = session.tokens().encode(adminAction);
         logger.debugv("pushRevocation resource: {0} url: {1}", resource.getClientId(), managementUrl);
         URI target = UriBuilder.fromUri(managementUrl).path(AdapterConstants.K_PUSH_NOT_BEFORE).build();
         try {

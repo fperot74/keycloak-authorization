@@ -3,7 +3,6 @@ package org.keycloak.protocol.docker;
 import org.keycloak.common.Profile;
 import org.keycloak.events.EventBuilder;
 import org.keycloak.models.ClientModel;
-import org.keycloak.models.ClientTemplateModel;
 import org.keycloak.models.KeycloakSession;
 import org.keycloak.models.ProtocolMapperModel;
 import org.keycloak.models.RealmModel;
@@ -12,26 +11,22 @@ import org.keycloak.protocol.LoginProtocol;
 import org.keycloak.protocol.docker.mapper.AllowAllDockerProtocolMapper;
 import org.keycloak.provider.EnvironmentDependentProviderFactory;
 import org.keycloak.representations.idm.ClientRepresentation;
-import org.keycloak.representations.idm.ClientTemplateRepresentation;
 
-import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.Collections;
-import java.util.List;
+import java.util.Map;
 
 public class DockerAuthV2ProtocolFactory extends AbstractLoginProtocolFactory implements EnvironmentDependentProviderFactory {
-
-    static List<ProtocolMapperModel> builtins = new ArrayList<>();
-    static List<ProtocolMapperModel> defaultBuiltins = new ArrayList<>();
+    private static Map<String, ProtocolMapperModel> builtins = new HashMap<>();
 
     static {
         final ProtocolMapperModel addAllRequestedScopeMapper = new ProtocolMapperModel();
         addAllRequestedScopeMapper.setName(AllowAllDockerProtocolMapper.PROVIDER_ID);
         addAllRequestedScopeMapper.setProtocolMapper(AllowAllDockerProtocolMapper.PROVIDER_ID);
         addAllRequestedScopeMapper.setProtocol(DockerAuthV2Protocol.LOGIN_PROTOCOL);
-        addAllRequestedScopeMapper.setConsentRequired(false);
-        addAllRequestedScopeMapper.setConfig(Collections.EMPTY_MAP);
-        builtins.add(addAllRequestedScopeMapper);
-        defaultBuiltins.add(addAllRequestedScopeMapper);
+        //addAllRequestedScopeMapper.setConsentRequired(false);
+        addAllRequestedScopeMapper.setConfig(Collections.emptyMap());
+        builtins.put(addAllRequestedScopeMapper.getName(), addAllRequestedScopeMapper);
     }
 
     @Override
@@ -41,13 +36,12 @@ public class DockerAuthV2ProtocolFactory extends AbstractLoginProtocolFactory im
     }
 
     @Override
-    public List<ProtocolMapperModel> getBuiltinMappers() {
-        return builtins;
+    protected void createDefaultClientScopesImpl(RealmModel newRealm) {
     }
 
     @Override
-    public List<ProtocolMapperModel> getDefaultBuiltinMappers() {
-        return defaultBuiltins;
+    public Map<String, ProtocolMapperModel> getBuiltinMappers() {
+        return builtins;
     }
 
     @Override
@@ -57,11 +51,6 @@ public class DockerAuthV2ProtocolFactory extends AbstractLoginProtocolFactory im
 
     @Override
     public void setupClientDefaults(final ClientRepresentation rep, final ClientModel newClient) {
-        // no-op
-    }
-
-    @Override
-    public void setupTemplateDefaults(final ClientTemplateRepresentation clientRep, final ClientTemplateModel newClient) {
         // no-op
     }
 

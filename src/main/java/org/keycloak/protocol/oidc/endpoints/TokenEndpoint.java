@@ -18,6 +18,8 @@
 package org.keycloak.protocol.oidc.endpoints;
 
 import io.cloudtrust.keycloak.protocol.LocalAuthorizationService;
+
+import org.apache.commons.lang.StringUtils;
 import org.jboss.logging.Logger;
 import org.jboss.resteasy.spi.HttpRequest;
 import org.jboss.resteasy.spi.HttpResponse;
@@ -25,8 +27,6 @@ import org.jboss.resteasy.spi.ResteasyProviderFactory;
 import org.keycloak.OAuth2Constants;
 import org.keycloak.OAuthErrorException;
 import org.keycloak.authentication.AuthenticationProcessor;
-import org.keycloak.authentication.authenticators.broker.AbstractIdpAuthenticator;
-import org.keycloak.authentication.authenticators.broker.util.SerializedBrokeredIdentityContext;
 import org.keycloak.broker.provider.BrokeredIdentityContext;
 import org.keycloak.broker.provider.ExchangeExternalToken;
 import org.keycloak.broker.provider.IdentityProvider;
@@ -48,7 +48,7 @@ import org.keycloak.jose.jws.JWSInputException;
 import org.keycloak.models.AuthenticationFlowModel;
 import org.keycloak.models.AuthenticatedClientSessionModel;
 import org.keycloak.models.ClientModel;
-import org.keycloak.models.Constants;
+import org.keycloak.models.ClientSessionContext;
 import org.keycloak.models.FederatedIdentityModel;
 import org.keycloak.models.IdentityProviderMapperModel;
 import org.keycloak.models.IdentityProviderModel;
@@ -57,16 +57,13 @@ import org.keycloak.models.KeycloakSessionFactory;
 import org.keycloak.models.RealmModel;
 import org.keycloak.models.UserModel;
 import org.keycloak.models.UserSessionModel;
-import org.keycloak.models.utils.KeycloakModelUtils;
 import org.keycloak.protocol.oidc.OIDCLoginProtocol;
 import org.keycloak.protocol.oidc.TokenManager;
 import org.keycloak.protocol.oidc.utils.AuthorizeClientUtil;
 import org.keycloak.representations.AccessToken;
 import org.keycloak.representations.AccessTokenResponse;
 import org.keycloak.representations.JsonWebToken;
-import org.keycloak.services.ErrorPage;
 import org.keycloak.services.CorsErrorResponseException;
-import org.keycloak.services.ErrorResponseException;
 import org.keycloak.services.ServicesLogger;
 import org.keycloak.services.Urls;
 import org.keycloak.services.managers.AuthenticationManager;
@@ -75,12 +72,11 @@ import org.keycloak.services.managers.BruteForceProtector;
 import org.keycloak.services.managers.ClientManager;
 import org.keycloak.services.managers.ClientSessionCode;
 import org.keycloak.services.managers.RealmManager;
-import org.keycloak.services.messages.Messages;
 import org.keycloak.services.resources.Cors;
 import org.keycloak.services.resources.IdentityBrokerService;
-import org.keycloak.services.resources.LoginActionsService;
 import org.keycloak.services.resources.admin.AdminAuth;
 import org.keycloak.services.resources.admin.permissions.AdminPermissions;
+import org.keycloak.services.util.DefaultClientSessionContext;
 import org.keycloak.services.validation.Validation;
 import org.keycloak.sessions.AuthenticationSessionModel;
 import org.keycloak.sessions.RootAuthenticationSessionModel;
@@ -95,28 +91,49 @@ import javax.ws.rs.core.HttpHeaders;
 import javax.ws.rs.core.MediaType;
 import javax.ws.rs.core.MultivaluedMap;
 import javax.ws.rs.core.Response;
+import javax.ws.rs.core.Response.Status;
 import javax.ws.rs.core.UriInfo;
-import java.net.URI;
-import java.util.List;
+
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
-import java.util.regex.Matcher;
+import java.util.function.Function;
 import java.util.regex.Pattern;
+import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 
 /**
  * @author <a href="mailto:sthorger@redhat.com">Stian Thorgersen</a>
  */
 public class TokenEndpoint {
-
     private static final Logger logger = Logger.getLogger(TokenEndpoint.class);
+
+    private static final String CLIENT_NOT_ALLOWED_TO_EXCHANGE = "Client not allowed to exchange";
+    private static final String NOT_AUTHORIZED = "not_authorized";
+
     private MultivaluedMap<String, String> formParams;
     private ClientModel client;
     private Map<String, String> clientAuthAttributes;
 
-    private enum Action {
-        AUTHORIZATION_CODE, REFRESH_TOKEN, PASSWORD, CLIENT_CREDENTIALS, TOKEN_EXCHANGE
+    protected enum Action {
+        // TODO: permissions have now been checked for AUTHORIZATION_CODE, REFRESH_TOKEN, PASSWORD, There is no need to that for CLIENT_CREDENTIALS.
+        // TODO: TOKEN_EXCHANGE need to be discussed
+        AUTHORIZATION_CODE(TokenEndpoint::codeToToken),
+        REFRESH_TOKEN(TokenEndpoint::refreshTokenGrant),
+        PASSWORD(TokenEndpoint::resourceOwnerPasswordCredentialsGrant),
+        CLIENT_CREDENTIALS(TokenEndpoint::clientCredentialsGrant),
+        TOKEN_EXCHANGE(TokenEndpoint::tokenExchange);
+
+        private Function<TokenEndpoint, Response> function;
+
+        private Action(Function<TokenEndpoint, Response> action) {
+            this.function = action;
+        }
+
+        public Response apply(TokenEndpoint te) {
+            return function.apply(te);
+        }
     }
 
     // https://tools.ietf.org/html/rfc7636#section-4.2
@@ -168,22 +185,7 @@ public class TokenEndpoint {
         checkGrantType();
         checkClient();
 
-        // TODO: permissions have now been checked for AUTHORIZATION_CODE, REFRESH_TOKEN, PASSWORD, There is no need to that for CLIENT_CREDENTIALS.
-        // TODO: TOKEN_EXCHANGE need to be discussed
-        switch (action) {
-            case AUTHORIZATION_CODE:
-                return codeToToken();
-            case REFRESH_TOKEN:
-                return refreshTokenGrant();
-            case PASSWORD:
-                return resourceOwnerPasswordCredentialsGrant();
-            case CLIENT_CREDENTIALS:
-                return clientCredentialsGrant();
-            case TOKEN_EXCHANGE:
-                return tokenExchange();
-        }
-
-        throw new RuntimeException("Unknown action " + action);
+        return action.apply(this);
     }
 
     @Path("introspect")
@@ -249,7 +251,6 @@ public class TokenEndpoint {
         } else if (grantType.equals(OAuth2Constants.TOKEN_EXCHANGE_GRANT_TYPE)) {
             event.event(EventType.TOKEN_EXCHANGE);
             action = Action.TOKEN_EXCHANGE;
-
         } else {
             throw new CorsErrorResponseException(cors, Errors.INVALID_REQUEST, "Invalid " + OIDCLoginProtocol.GRANT_TYPE_PARAM, Response.Status.BAD_REQUEST);
         }
@@ -263,22 +264,17 @@ public class TokenEndpoint {
             event.error(Errors.INVALID_CODE);
             throw new CorsErrorResponseException(cors, OAuthErrorException.INVALID_REQUEST, "Missing parameter: " + OAuth2Constants.CODE, Response.Status.BAD_REQUEST);
         }
-
         ClientSessionCode.ParseResult<AuthenticatedClientSessionModel> parseResult = ClientSessionCode.parseResult(code, null, session, realm, client, event, AuthenticatedClientSessionModel.class);
+        AuthenticatedClientSessionModel clientSession = parseResult.getClientSession();
         if (parseResult.isAuthSessionNotFound() || parseResult.isIllegalHash()) {
-            AuthenticatedClientSessionModel clientSession = parseResult.getClientSession();
-
             // Attempt to use same code twice should invalidate existing clientSession
             if (clientSession != null) {
                 clientSession.detachFromUserSession();
             }
 
             event.error(Errors.INVALID_CODE);
-
             throw new CorsErrorResponseException(cors, OAuthErrorException.INVALID_GRANT, "Code not valid", Response.Status.BAD_REQUEST);
         }
-
-        AuthenticatedClientSessionModel clientSession = parseResult.getClientSession();
 
         if (parseResult.isExpiredToken()) {
             event.error(Errors.EXPIRED_CODE);
@@ -286,12 +282,10 @@ public class TokenEndpoint {
         }
 
         UserSessionModel userSession = clientSession.getUserSession();
-
         if (userSession == null) {
             event.error(Errors.USER_SESSION_NOT_FOUND);
             throw new CorsErrorResponseException(cors, OAuthErrorException.INVALID_GRANT, "User session not found", Response.Status.BAD_REQUEST);
         }
-
 
         UserModel user = userSession.getUser();
         if (user == null) {
@@ -312,7 +306,7 @@ public class TokenEndpoint {
         // KEYCLOAK-4478 Backwards compatibility with the adapters earlier than KC 3.4.2
         if (redirectUriParam.contains("session_state=")) {
             redirectUriParam = KeycloakUriBuilder.fromUri(redirectUriParam)
-                    .replaceQueryParam(OAuth2Constants.SESSION_STATE, null)
+                    .replaceQueryParam(OAuth2Constants.SESSION_STATE)
                     .build().toString();
         }
 
@@ -340,14 +334,9 @@ public class TokenEndpoint {
         String codeVerifier = formParams.getFirst(OAuth2Constants.CODE_VERIFIER);
         String codeChallenge = clientSession.getNote(OIDCLoginProtocol.CODE_CHALLENGE_PARAM);
         String codeChallengeMethod = clientSession.getNote(OIDCLoginProtocol.CODE_CHALLENGE_METHOD_PARAM);
-        String authUserId = user.getId();
-        String authUsername = user.getUsername();
-        if (authUserId == null) {
-            authUserId = "unknown";
-        }
-        if (authUsername == null) {
-            authUsername = "unknown";
-        }
+        String authUserId = StringUtils.defaultString(user.getId(), "unknown");
+        String authUsername = StringUtils.defaultString(user.getUsername(), "unknown");
+
         if (codeChallenge != null && codeVerifier == null) {
             logger.warnf("PKCE code verifier not specified, authUserId = %s, authUsername = %s", authUserId, authUsername);
             event.error(Errors.CODE_VERIFIER_MISSING);
@@ -389,29 +378,38 @@ public class TokenEndpoint {
             }
         }
 
-
         updateClientSession(clientSession);
         updateUserSessionFromClientAuth(userSession);
 
         LocalAuthorizationService authorize = new LocalAuthorizationService(session, realm);
-        ClientSessionCode<AuthenticatedClientSessionModel> accessCode = new ClientSessionCode<>(session, realm, clientSession);
         boolean authorized;
-        try{
-            authorized = authorize.isAuthorized(client, userSession, clientSession, accessCode, null);
-        } catch (Exception e){
+        try {
+            ClientSessionContext clientSessionCtx = new AuthenticationProcessor()
+                    .setAuthenticationSession(null /*authSession*/)
+                    .setFlowId(realm.getDirectGrantFlow().getId())
+                    .setConnection(clientConnection)
+                    .setEventBuilder(event)
+                    .setRealm(realm)
+                    .setSession(session)
+                    .setUriInfo(uriInfo)
+                    .setRequest(request)
+                    .attachSession();
+            authorized = authorize.isAuthorized(client, userSession, clientSessionCtx, null);
+        } catch (Exception e) {
             return cors.builder(Response.status(Response.Status.INTERNAL_SERVER_ERROR).entity("Error while evaluating permissions.")).build();
         }
-        if(!authorized){
-            return cors.builder(Response.status(Response.Status.FORBIDDEN).entity("not_authorized")).build();
+        if (!authorized) {
+            return cors.builder(Response.status(Response.Status.FORBIDDEN).entity(NOT_AUTHORIZED)).build();
         }
 
-        AccessToken token = tokenManager.createClientAccessToken(session, parseResult.getCode().getRequestedRoles(), realm, client, user, userSession, clientSession);
+        String scopeParam = clientSession.getNote(OAuth2Constants.SCOPE);
+        ClientSessionContext clientSessionCtx = DefaultClientSessionContext.fromClientSessionAndScopeParameter(clientSession, scopeParam);
 
-        TokenManager.AccessTokenResponseBuilder responseBuilder = tokenManager.responseBuilder(realm, client, event, session, userSession, clientSession)
+        AccessToken token = tokenManager.createClientAccessToken(session, realm, client, user, userSession, clientSessionCtx);
+        TokenManager.AccessTokenResponseBuilder responseBuilder = tokenManager.responseBuilder(realm, client, event, session, userSession, clientSessionCtx)
                 .accessToken(token)
                 .generateRefreshToken();
 
-        String scopeParam = clientSession.getNote(OAuth2Constants.SCOPE);
         if (TokenUtil.isOIDCRequest(scopeParam)) {
             responseBuilder.generateIDToken();
         }
@@ -431,7 +429,7 @@ public class TokenEndpoint {
 
         AccessTokenResponse res;
         try {
-            TokenManager.RefreshResult result = tokenManager.refreshAccessToken(session, uriInfo, clientConnection, realm, client, refreshToken, event, headers);
+            TokenManager.RefreshResult result = tokenManager.refreshAccessToken(session, uriInfo, clientConnection, realm, client, refreshToken, event, headers, request);
             res = result.getResponse();
 
             UserSessionModel userSession = session.sessions().getUserSession(realm, res.getSessionState());
@@ -442,18 +440,16 @@ public class TokenEndpoint {
                 updateUserSessionFromClientAuth(userSession);
             }
 
+            ClientSessionContext clientSessionCtx = DefaultClientSessionContext.fromClientSessionScopeParameter(clientSession);
+
             LocalAuthorizationService authorize = new LocalAuthorizationService(session, realm);
-            ClientSessionCode<AuthenticatedClientSessionModel> accessCode = new ClientSessionCode<>(session, realm, clientSession);
-            boolean authorized;
-            try{
-                authorized = authorize.isAuthorized(client, userSession, clientSession, accessCode, null);
+            try {
+                if (!authorize.isAuthorized(client, userSession, clientSessionCtx, null)) {
+                    return cors.builder(Response.status(Response.Status.FORBIDDEN).entity(NOT_AUTHORIZED)).build();
+                }
             } catch (Exception e){
                 return cors.builder(Response.status(Response.Status.INTERNAL_SERVER_ERROR).entity("Error while evaluating permissions.")).build();
             }
-            if(!authorized){
-                return cors.builder(Response.status(Response.Status.FORBIDDEN).entity("not_authorized")).build();
-            }
-
         } catch (OAuthErrorException e) {
             logger.trace(e.getMessage(), e);
             event.error(Errors.INVALID_TOKEN);
@@ -537,31 +533,31 @@ public class TokenEndpoint {
         }
         processor.evaluateRequiredActionTriggers();
         UserModel user = authSession.getAuthenticatedUser();
-        if (user.getRequiredActions() != null && user.getRequiredActions().size() > 0) {
+        if (user.getRequiredActions() != null && !user.getRequiredActions().isEmpty()) {
             event.error(Errors.RESOLVE_REQUIRED_ACTIONS);
             throw new CorsErrorResponseException(cors, OAuthErrorException.INVALID_GRANT, "Invalid user credentials", Response.Status.UNAUTHORIZED);
 
         }
 
-        AuthenticationManager.setRolesAndMappersInSession(authSession);
+        AuthenticationManager.setClientScopesInSession(authSession);
 
-        AuthenticatedClientSessionModel clientSession = processor.attachSession();
+        ClientSessionContext clientSessionCtx = processor.attachSession();
+        AuthenticatedClientSessionModel clientSession = clientSessionCtx.getClientSession();
         UserSessionModel userSession = processor.getUserSession();
         updateUserSessionFromClientAuth(userSession);
 
         LocalAuthorizationService authorize = new LocalAuthorizationService(session, realm);
-        ClientSessionCode<AuthenticatedClientSessionModel> accessCode = new ClientSessionCode<>(session, realm, clientSession);
         boolean authorized;
         try{
-            authorized = authorize.isAuthorized(client, userSession, clientSession, accessCode, null);
+            authorized = authorize.isAuthorized(client, userSession, clientSessionCtx, null);
         } catch (Exception e){
             return cors.builder(Response.status(Response.Status.INTERNAL_SERVER_ERROR).entity("Error while evaluating permissions.")).build();
         }
         if(!authorized){
-            return cors.builder(Response.status(Response.Status.FORBIDDEN).entity("not_authorized")).build();
+            return cors.builder(Response.status(Response.Status.FORBIDDEN).entity(NOT_AUTHORIZED)).build();
         }
 
-        TokenManager.AccessTokenResponseBuilder responseBuilder = tokenManager.responseBuilder(realm, client, event, session, userSession, clientSession)
+        TokenManager.AccessTokenResponseBuilder responseBuilder = tokenManager.responseBuilder(realm, client, event, session, userSession, clientSessionCtx)
                 .generateAccessToken()
                 .generateRefreshToken();
 
@@ -571,8 +567,6 @@ public class TokenEndpoint {
         }
 
         AccessTokenResponse res = responseBuilder.build();
-
-
         event.success();
 
         return cors.builder(Response.ok(res, MediaType.APPLICATION_JSON_TYPE)).build();
@@ -610,22 +604,14 @@ public class TokenEndpoint {
             throw new CorsErrorResponseException(cors, OAuthErrorException.INVALID_REQUEST, "User '" + clientUsername + "' disabled", Response.Status.UNAUTHORIZED);
         }
 
-        String scope = formParams.getFirst(OAuth2Constants.SCOPE);
+        AuthenticationSessionModel authSession = createAuthenticationSession(this.client, clientUser);
 
-        RootAuthenticationSessionModel rootAuthSession = new AuthenticationSessionManager(session).createAuthenticationSession(realm, false);
-        AuthenticationSessionModel authSession = rootAuthSession.createAuthenticationSession(client);
-
-        authSession.setAuthenticatedUser(clientUser);
-        authSession.setProtocol(OIDCLoginProtocol.LOGIN_PROTOCOL);
-        authSession.setClientNote(OIDCLoginProtocol.ISSUER, Urls.realmIssuer(uriInfo.getBaseUri(), realm.getName()));
-        authSession.setClientNote(OIDCLoginProtocol.SCOPE_PARAM, scope);
-
-        UserSessionModel userSession = session.sessions().createUserSession(authSession.getParentSession().getId(), realm, clientUser, clientUsername,
-                clientConnection.getRemoteAddr(), ServiceAccountConstants.CLIENT_AUTH, false, null, null);
+        UserSessionModel userSession = this.session.sessions().createUserSession(authSession.getParentSession().getId(), realm, clientUser, clientUsername,
+                this.clientConnection.getRemoteAddr(), ServiceAccountConstants.CLIENT_AUTH, false, null, null);
         event.session(userSession);
 
-        AuthenticationManager.setRolesAndMappersInSession(authSession);
-        AuthenticatedClientSessionModel clientSession = TokenManager.attachAuthenticationSession(session, userSession, authSession);
+        AuthenticationManager.setClientScopesInSession(authSession);
+        ClientSessionContext clientSession = TokenManager.attachAuthenticationSession(session, userSession, authSession);
 
         // Notes about client details
         userSession.setNote(ServiceAccountConstants.CLIENT_ID, client.getClientId());
@@ -638,7 +624,7 @@ public class TokenEndpoint {
                 .generateAccessToken()
                 .generateRefreshToken();
 
-        String scopeParam = clientSession.getNote(OAuth2Constants.SCOPE);
+        String scopeParam = clientSession.getClientSession().getNote(OAuth2Constants.SCOPE);
         if (TokenUtil.isOIDCRequest(scopeParam)) {
             responseBuilder.generateIDToken();
         }
@@ -648,6 +634,41 @@ public class TokenEndpoint {
         event.success();
 
         return cors.builder(Response.ok(res, MediaType.APPLICATION_JSON_TYPE)).build();
+    }
+
+    enum TokenFailure {
+        JWT_PARSING("unable to parse jwt subject_token", Errors.INVALID_TOKEN, OAuthErrorException.INVALID_TOKEN, "Invalid token type, must be access token"),
+        NEED_ACCESS_TOKEN("subject_token supports access tokens only", Errors.INVALID_TOKEN, OAuthErrorException.INVALID_TOKEN, "Invalid token type, must be access token"),
+        SUBJECT_TOKEN_VALIDATION("subject_token validation failure", Errors.INVALID_TOKEN, OAuthErrorException.INVALID_TOKEN, "Invalid token"),
+        SUBJECT_NOT_FOUND("requested_subject not found", Errors.NOT_ALLOWED, OAuthErrorException.ACCESS_DENIED, CLIENT_NOT_ALLOWED_TO_EXCHANGE, Response.Status.FORBIDDEN),
+        CANT_IMPERSONATE_SUBJECT("subject not allowed to impersonate", Errors.NOT_ALLOWED, OAuthErrorException.ACCESS_DENIED, CLIENT_NOT_ALLOWED_TO_EXCHANGE, Response.Status.FORBIDDEN),
+        PUBLIC_CLIENTS_NOT_ALLOWED("public clients not allowed", Errors.NOT_ALLOWED, OAuthErrorException.ACCESS_DENIED, CLIENT_NOT_ALLOWED_TO_EXCHANGE, Response.Status.FORBIDDEN),
+        CANT_IMPERSONATE_CLIENT("client not allowed to impersonate", Errors.NOT_ALLOWED, OAuthErrorException.ACCESS_DENIED, CLIENT_NOT_ALLOWED_TO_EXCHANGE, Response.Status.FORBIDDEN)
+        ;
+
+        private final String eventDetail;
+        private final String eventError;
+        private final String oAuthError;
+        private final String corsError;
+        private final Status status;
+
+        private TokenFailure(final String eventDetail, final String eventError, final String oAuthError, final String corsError) {
+            this(eventDetail, eventError, oAuthError, corsError, Response.Status.BAD_REQUEST);
+        }
+
+        private TokenFailure(final String eventDetail, final String eventError, final String oAuthError, final String corsError, final Response.Status status) {
+            this.eventDetail = eventDetail;
+            this.eventError = eventError;
+            this.oAuthError = oAuthError;
+            this.corsError = corsError;
+            this.status = status;
+        }
+
+        public CorsErrorResponseException fail(Cors cors, EventBuilder event) {
+            event.detail(Details.REASON, this.eventDetail);
+            event.error(this.eventError);
+            return new CorsErrorResponseException(cors, oAuthError, this.corsError, this.status);
+        }
     }
 
     public Response tokenExchange() {
@@ -672,31 +693,23 @@ public class TokenEndpoint {
                     JsonWebToken jwt = jws.readJsonContent(JsonWebToken.class);
                     subjectIssuer = jwt.getIssuer();
                 } catch (JWSInputException e) {
-                    event.detail(Details.REASON, "unable to parse jwt subject_token");
-                    event.error(Errors.INVALID_TOKEN);
-                    throw new CorsErrorResponseException(cors, OAuthErrorException.INVALID_TOKEN, "Invalid token type, must be access token", Response.Status.BAD_REQUEST);
-
+                    throw TokenFailure.JWT_PARSING.fail(cors, event);
                 }
             }
 
             if (subjectIssuer != null && !realmIssuerUrl.equals(subjectIssuer)) {
                 event.detail(OAuth2Constants.SUBJECT_ISSUER, subjectIssuer);
                 return exchangeExternalToken(subjectIssuer, subjectToken);
-
             }
 
             if (subjectTokenType != null && !subjectTokenType.equals(OAuth2Constants.ACCESS_TOKEN_TYPE)) {
-                event.detail(Details.REASON, "subject_token supports access tokens only");
-                event.error(Errors.INVALID_TOKEN);
-                throw new CorsErrorResponseException(cors, OAuthErrorException.INVALID_TOKEN, "Invalid token type, must be access token", Response.Status.BAD_REQUEST);
-
+                throw TokenFailure.NEED_ACCESS_TOKEN.fail(cors, event);
             }
 
+            @SuppressWarnings("unchecked")
             AuthenticationManager.AuthResult authResult = AuthenticationManager.verifyIdentityToken(session, realm, uriInfo, clientConnection, true, true, false, subjectToken, headers);
             if (authResult == null) {
-                event.detail(Details.REASON, "subject_token validation failure");
-                event.error(Errors.INVALID_TOKEN);
-                throw new CorsErrorResponseException(cors, OAuthErrorException.INVALID_TOKEN, "Invalid token", Response.Status.BAD_REQUEST);
+                throw TokenFailure.SUBJECT_TOKEN_VALIDATION.fail(cors, event);
             }
 
             tokenUser = authResult.getUser();
@@ -714,10 +727,7 @@ public class TokenEndpoint {
 
             if (requestedUser == null) {
                 // We always returned access denied to avoid username fishing
-                event.detail(Details.REASON, "requested_subject not found");
-                event.error(Errors.NOT_ALLOWED);
-                throw new CorsErrorResponseException(cors, OAuthErrorException.ACCESS_DENIED, "Client not allowed to exchange", Response.Status.FORBIDDEN);
-
+                throw TokenFailure.SUBJECT_NOT_FOUND.fail(cors, event);
             }
 
             if (token != null) {
@@ -725,24 +735,16 @@ public class TokenEndpoint {
                 // for this case, the user represented by the token, must have permission to impersonate.
                 AdminAuth auth = new AdminAuth(realm, token, tokenUser, client);
                 if (!AdminPermissions.evaluator(session, realm, auth).users().canImpersonate(requestedUser)) {
-                    event.detail(Details.REASON, "subject not allowed to impersonate");
-                    event.error(Errors.NOT_ALLOWED);
-                    throw new CorsErrorResponseException(cors, OAuthErrorException.ACCESS_DENIED, "Client not allowed to exchange", Response.Status.FORBIDDEN);
+                    throw TokenFailure.CANT_IMPERSONATE_SUBJECT.fail(cors, event);
                 }
-
             } else {
                 // no token is being exchanged, this is a direct exchange.  Client must be authenticated, not public, and must be allowed
                 // to impersonate
                 if (client.isPublicClient()) {
-                    event.detail(Details.REASON, "public clients not allowed");
-                    event.error(Errors.NOT_ALLOWED);
-                    throw new CorsErrorResponseException(cors, OAuthErrorException.ACCESS_DENIED, "Client not allowed to exchange", Response.Status.FORBIDDEN);
-
+                    throw TokenFailure.PUBLIC_CLIENTS_NOT_ALLOWED.fail(cors, event);
                 }
                 if (!AdminPermissions.management(session, realm).users().canClientImpersonate(client, requestedUser)) {
-                    event.detail(Details.REASON, "client not allowed to impersonate");
-                    event.error(Errors.NOT_ALLOWED);
-                    throw new CorsErrorResponseException(cors, OAuthErrorException.ACCESS_DENIED, "Client not allowed to exchange", Response.Status.FORBIDDEN);
+                    throw TokenFailure.CANT_IMPERSONATE_CLIENT.fail(cors, event);
                 }
             }
 
@@ -762,7 +764,7 @@ public class TokenEndpoint {
                     try {
                         session.sessions().removeUserSession(realm, tokenSession);
                     } catch (Exception ignore) {
-
+                        // Ignore exception
                     }
                 }
             }
@@ -778,7 +780,7 @@ public class TokenEndpoint {
             throw new CorsErrorResponseException(cors, OAuthErrorException.INVALID_REQUEST, "Invalid issuer", Response.Status.BAD_REQUEST);
         }
 
-        IdentityProvider provider = IdentityBrokerService.getIdentityProvider(session, realm, requestedIssuer);
+        IdentityProvider<?> provider = IdentityBrokerService.getIdentityProvider(session, realm, requestedIssuer);
         if (!(provider instanceof ExchangeTokenToIdentityProviderToken)) {
             event.detail(Details.REASON, "exchange unsupported by requested_issuer");
             event.error(Errors.UNKNOWN_IDENTITY_PROVIDER);
@@ -787,7 +789,7 @@ public class TokenEndpoint {
         if (!AdminPermissions.management(session, realm).idps().canExchangeTo(client, providerModel)) {
             event.detail(Details.REASON, "client not allowed to exchange for requested_issuer");
             event.error(Errors.NOT_ALLOWED);
-            throw new CorsErrorResponseException(cors, OAuthErrorException.ACCESS_DENIED, "Client not allowed to exchange", Response.Status.FORBIDDEN);
+            throw new CorsErrorResponseException(cors, OAuthErrorException.ACCESS_DENIED, CLIENT_NOT_ALLOWED_TO_EXCHANGE, Response.Status.FORBIDDEN);
         }
         Response response = ((ExchangeTokenToIdentityProviderToken)provider).exchangeFromToken(uriInfo, event, client, targetUserSession, targetUser, formParams);
         return cors.builder(Response.fromResponse(response)).build();
@@ -804,24 +806,56 @@ public class TokenEndpoint {
             throw new CorsErrorResponseException(cors, OAuthErrorException.INVALID_REQUEST, "requested_token_type unsupported", Response.Status.BAD_REQUEST);
 
         }
-        ClientModel targetClient = client;
-        String audience = formParams.getFirst(OAuth2Constants.AUDIENCE);
+        ClientModel targetClient = this.client;
+        String audience = this.formParams.getFirst(OAuth2Constants.AUDIENCE);
         if (audience != null) {
             targetClient = realm.getClientByClientId(audience);
         }
 
         if (targetClient.isConsentRequired()) {
-            event.detail(Details.REASON, "audience requires consent");
-            event.error(Errors.CONSENT_DENIED);
+            this.event.detail(Details.REASON, "audience requires consent");
+            this.event.error(Errors.CONSENT_DENIED);
             throw new CorsErrorResponseException(cors, OAuthErrorException.INVALID_CLIENT, "Client requires user consent", Response.Status.BAD_REQUEST);
         }
 
-        if (!targetClient.equals(client) && !AdminPermissions.management(session, realm).clients().canExchangeTo(client, targetClient)) {
-            event.detail(Details.REASON, "client not allowed to exchange to audience");
-            event.error(Errors.NOT_ALLOWED);
-            throw new CorsErrorResponseException(cors, OAuthErrorException.ACCESS_DENIED, "Client not allowed to exchange", Response.Status.FORBIDDEN);
+        if (!targetClient.equals(client) && !AdminPermissions.management(session, realm).clients().canExchangeTo(this.client, targetClient)) {
+            this.event.detail(Details.REASON, "client not allowed to exchange to audience");
+            this.event.error(Errors.NOT_ALLOWED);
+            throw new CorsErrorResponseException(cors, OAuthErrorException.ACCESS_DENIED, CLIENT_NOT_ALLOWED_TO_EXCHANGE, Response.Status.FORBIDDEN);
         }
 
+        AuthenticationSessionModel authSession = createAuthenticationSession(targetClient, targetUser);
+
+        this.event.session(targetUserSession);
+
+        AuthenticationManager.setClientScopesInSession(authSession);
+        ClientSessionContext clientSession = TokenManager.attachAuthenticationSession(this.session, targetUserSession, authSession);
+
+        updateUserSessionFromClientAuth(targetUserSession);
+
+        TokenManager.AccessTokenResponseBuilder responseBuilder = this.tokenManager.responseBuilder(realm, targetClient, this.event, this.session, targetUserSession, clientSession)
+                .generateAccessToken();
+        responseBuilder.getAccessToken().issuedFor(this.client.getClientId());
+
+        if (requestedTokenType.equals(OAuth2Constants.REFRESH_TOKEN_TYPE)) {
+            responseBuilder.generateRefreshToken();
+            responseBuilder.getRefreshToken().issuedFor(this.client.getClientId());
+        }
+
+        String scopeParam = clientSession.getClientSession().getNote(OAuth2Constants.SCOPE);
+        if (TokenUtil.isOIDCRequest(scopeParam)) {
+            responseBuilder.generateIDToken();
+        }
+
+        AccessTokenResponse res = responseBuilder.build();
+        this.event.detail(Details.AUDIENCE, targetClient.getClientId());
+
+        this.event.success();
+
+        return cors.builder(Response.ok(res, MediaType.APPLICATION_JSON_TYPE)).build();
+    }
+
+    private AuthenticationSessionModel createAuthenticationSession(ClientModel targetClient, UserModel targetUser) {
         String scope = formParams.getFirst(OAuth2Constants.SCOPE);
 
         RootAuthenticationSessionModel rootAuthSession = new AuthenticationSessionManager(session).createAuthenticationSession(realm, false);
@@ -832,33 +866,7 @@ public class TokenEndpoint {
         authSession.setClientNote(OIDCLoginProtocol.ISSUER, Urls.realmIssuer(uriInfo.getBaseUri(), realm.getName()));
         authSession.setClientNote(OIDCLoginProtocol.SCOPE_PARAM, scope);
 
-        event.session(targetUserSession);
-
-        AuthenticationManager.setRolesAndMappersInSession(authSession);
-        AuthenticatedClientSessionModel clientSession = TokenManager.attachAuthenticationSession(this.session, targetUserSession, authSession);
-
-        updateUserSessionFromClientAuth(targetUserSession);
-
-        TokenManager.AccessTokenResponseBuilder responseBuilder = tokenManager.responseBuilder(realm, targetClient, event, this.session, targetUserSession, clientSession)
-                .generateAccessToken();
-        responseBuilder.getAccessToken().issuedFor(client.getClientId());
-
-        if (requestedTokenType.equals(OAuth2Constants.REFRESH_TOKEN_TYPE)) {
-            responseBuilder.generateRefreshToken();
-            responseBuilder.getRefreshToken().issuedFor(client.getClientId());
-        }
-
-        String scopeParam = clientSession.getNote(OAuth2Constants.SCOPE);
-        if (TokenUtil.isOIDCRequest(scopeParam)) {
-            responseBuilder.generateIDToken();
-        }
-
-        AccessTokenResponse res = responseBuilder.build();
-        event.detail(Details.AUDIENCE, targetClient.getClientId());
-
-        event.success();
-
-        return cors.builder(Response.ok(res, MediaType.APPLICATION_JSON_TYPE)).build();
+        return authSession;
     }
 
     public Response exchangeExternalToken(String issuer, String subjectToken) {
@@ -866,8 +874,8 @@ public class TokenEndpoint {
         IdentityProviderModel externalIdpModel = null;
 
         for (IdentityProviderModel idpModel : realm.getIdentityProviders()) {
-            IdentityProviderFactory factory = IdentityBrokerService.getIdentityProviderFactory(session, idpModel);
-            IdentityProvider idp = factory.create(session, idpModel);
+            IdentityProviderFactory<?> factory = IdentityBrokerService.getIdentityProviderFactory(session, idpModel);
+            IdentityProvider<?> idp = factory.create(session, idpModel);
             if (idp instanceof ExchangeExternalToken) {
                 ExchangeExternalToken external = (ExchangeExternalToken) idp;
                 if (idpModel.getAlias().equals(issuer) || external.isIssuer(issuer, formParams)) {
@@ -886,7 +894,7 @@ public class TokenEndpoint {
         if (!AdminPermissions.management(session, realm).idps().canExchangeTo(client, externalIdpModel)) {
             event.detail(Details.REASON, "client not allowed to exchange subject_issuer");
             event.error(Errors.NOT_ALLOWED);
-            throw new CorsErrorResponseException(cors, OAuthErrorException.ACCESS_DENIED, "Client not allowed to exchange", Response.Status.FORBIDDEN);
+            throw new CorsErrorResponseException(cors, OAuthErrorException.ACCESS_DENIED, CLIENT_NOT_ALLOWED_TO_EXCHANGE, Response.Status.FORBIDDEN);
         }
         BrokeredIdentityContext context = externalIdp.exchangeExternal(event, formParams);
         if (context == null) {
@@ -928,18 +936,15 @@ public class TokenEndpoint {
             }
         }
 
-        FederatedIdentityModel federatedIdentityModel = new FederatedIdentityModel(providerId, context.getId(),
-                context.getUsername(), context.getToken());
+        FederatedIdentityModel federatedIdentityModel = new FederatedIdentityModel(providerId, context.getId(), context.getUsername(), context.getToken());
 
         UserModel user = this.session.users().getUserByFederatedIdentity(federatedIdentityModel, realm);
-
         if (user == null) {
-
             logger.debugf("Federated user not found for provider '%s' and broker username '%s'.", providerId, context.getUsername());
 
             String username = context.getModelUsername();
             if (username == null) {
-                if (this.realm.isRegistrationEmailAsUsername() && !Validation.isBlank(context.getEmail())) {
+                if (realm.isRegistrationEmailAsUsername() && !Validation.isBlank(context.getEmail())) {
                     username = context.getEmail();
                 } else if (context.getUsername() == null) {
                     username = context.getIdpConfig().getAlias() + "." + context.getId();
@@ -993,11 +998,9 @@ public class TokenEndpoint {
                 event.error(Errors.USER_DISABLED);
                 throw new CorsErrorResponseException(cors, Errors.INVALID_TOKEN, "Invalid Token", Response.Status.BAD_REQUEST);
             }
-            if (realm.isBruteForceProtected()) {
-                if (session.getProvider(BruteForceProtector.class).isTemporarilyDisabled(session, realm, user)) {
-                    event.error(Errors.USER_TEMPORARILY_DISABLED);
-                    throw new CorsErrorResponseException(cors, Errors.INVALID_TOKEN, "Invalid Token", Response.Status.BAD_REQUEST);
-                }
+            if (realm.isBruteForceProtected() && session.getProvider(BruteForceProtector.class).isTemporarilyDisabled(session, realm, user)) {
+                event.error(Errors.USER_TEMPORARILY_DISABLED);
+                throw new CorsErrorResponseException(cors, Errors.INVALID_TOKEN, "Invalid Token", Response.Status.BAD_REQUEST);
             }
 
             context.getIdp().updateBrokeredUser(session, realm, user, context);
@@ -1023,17 +1026,15 @@ public class TokenEndpoint {
             logger.infof(" Error: PKCE codeVerifier length over upper limit , codeVerifier = %s", codeVerifier);
             return false;
         }
-        Matcher m = VALID_CODE_VERIFIER_PATTERN.matcher(codeVerifier);
-        return m.matches() ? true : false;
+        return VALID_CODE_VERIFIER_PATTERN.matcher(codeVerifier).matches();
     }
 
     // https://tools.ietf.org/html/rfc7636#section-4.6
-    private String generateS256CodeChallenge(String codeVerifier) throws Exception {
+    private String generateS256CodeChallenge(String codeVerifier) throws NoSuchAlgorithmException {
         MessageDigest md = MessageDigest.getInstance("SHA-256");
-        md.update(codeVerifier.getBytes("ISO_8859_1"));
+        md.update(codeVerifier.getBytes(StandardCharsets.ISO_8859_1));
         byte[] digestBytes = md.digest();
-        String codeVerifierEncoded = Base64Url.encode(digestBytes);
-        return codeVerifierEncoded;
+        return Base64Url.encode(digestBytes);
     }
 
 }

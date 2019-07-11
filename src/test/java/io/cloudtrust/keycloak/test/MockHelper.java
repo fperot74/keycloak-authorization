@@ -5,6 +5,8 @@ import org.keycloak.authorization.AuthorizationProvider;
 import org.keycloak.authorization.model.Policy;
 import org.keycloak.authorization.model.Resource;
 import org.keycloak.authorization.model.ResourceServer;
+import org.keycloak.authorization.policy.evaluation.DefaultPolicyEvaluator;
+import org.keycloak.authorization.policy.evaluation.PolicyEvaluator;
 import org.keycloak.authorization.policy.provider.PolicyProviderFactory;
 import org.keycloak.authorization.policy.provider.group.GroupPolicyProviderFactory;
 import org.keycloak.authorization.policy.provider.user.UserPolicyProviderFactory;
@@ -14,12 +16,17 @@ import org.keycloak.authorization.store.ResourceStore;
 import org.keycloak.authorization.store.StoreFactory;
 import org.keycloak.common.enums.SslRequired;
 import org.keycloak.common.util.CertificateUtils;
+import org.keycloak.crypto.Algorithm;
+import org.keycloak.crypto.KeyStatus;
+import org.keycloak.crypto.KeyWrapper;
 import org.keycloak.forms.login.LoginFormsProvider;
 import org.keycloak.models.*;
 import org.keycloak.protocol.ProtocolMapper;
+import org.keycloak.protocol.oidc.OIDCLoginProtocol;
 import org.keycloak.representations.idm.authorization.DecisionStrategy;
 import org.keycloak.representations.idm.authorization.Logic;
 import org.keycloak.representations.idm.authorization.PolicyEnforcementMode;
+import org.keycloak.sessions.AuthenticationSessionModel;
 import org.keycloak.util.JsonSerialization;
 import org.mockito.Mock;
 import org.mockito.Mockito;
@@ -27,8 +34,6 @@ import org.mockito.MockitoAnnotations;
 import org.mockito.invocation.InvocationOnMock;
 import org.mockito.stubbing.Answer;
 
-import javax.crypto.SecretKey;
-import javax.crypto.spec.SecretKeySpec;
 import javax.ws.rs.core.Response;
 import javax.ws.rs.core.UriBuilder;
 import javax.ws.rs.core.UriInfo;
@@ -36,14 +41,13 @@ import java.io.IOException;
 import java.net.URI;
 import java.security.KeyPair;
 import java.security.KeyPairGenerator;
-import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.security.cert.X509Certificate;
 import java.util.*;
+import java.util.function.Consumer;
 
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
-import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.when;
 
 /**
@@ -70,6 +74,16 @@ import static org.mockito.Mockito.when;
  * but replaced by actual objects). However, think long and hard before mocking any other behaviour or logic.
  */
 public class MockHelper {
+    private static final String CLIENT_ID = "111a21d3-b04a-497d-a50e-0ee4ad3a2482";
+    private static final String GROUP1_ID = "222e1324-3529-4ea7-a97d-dab608a4111d";
+    private static final String GROUP2_ID = "333e1324-3529-4ea7-a97d-dab608a4111d";
+    private static final String USER_ID = "444169e4-82ac-4f7b-a8e3-9806d34c2825";
+    private static final String ROLE_ID = "55540343-ca14-48e1-addf-2a881d3a6266";
+    private static final String RESOURCE_ID = "666ab617-a504-4930-99e8-64cfdaa10576";
+    private static final String USER_SESSION_ID = "777fd167-bdf8-43e0-a9b6-16d25c7428ec";
+    private static final String BROKER_SESSION_ID = "88840677-c6db-41bd-9d1f-0bef90ff65ad";
+    private static final String CLIENT_SESSION_ID = "9999d5be-4926-494c-9b4c-34fd8cb152c4";
+    private static final String KID_UUID = "000ab187-6e23-4c20-9490-433508746e37";
 
     //Mocks for DB elements
     @Mock
@@ -104,6 +118,8 @@ public class MockHelper {
     private Policy userPolicy;
     @Mock
     private Policy groupPolicy;
+    //@Mock
+    private PolicyEvaluator policyEvaluator = new DefaultPolicyEvaluator();
 
     //Mocks for sessions
     @Mock
@@ -111,13 +127,17 @@ public class MockHelper {
     @Mock
     private KeycloakSessionFactory sessionFactory;
     @Mock
+    private AuthenticationSessionModel authenticationSession;
+    @Mock
     private UserSessionModel userSession;
     @Mock
     private AuthenticatedClientSessionModel clientSession;
+    @Mock
+    private ClientSessionContext clientSessionCtx;
 
     //Other mocks
     @Mock
-    private UriInfo uriInfo;
+    private KeycloakUriInfo uriInfo;
     @Mock
     private KeyManager keyManager;
 
@@ -148,17 +168,19 @@ public class MockHelper {
         initPolicy();
 
         initUserSession();
+        initClientSessionContext();
         initClientSession();
         initSession();
+        initAuthenticationSession();
 
         initUriInfo();
         initKeyManager();
     }
 
-    private void initGroup() {
-        when(group1.getId()).thenReturn("32be1324-3529-4ea7-a97d-dab608a4111d");
+	private void initGroup() {
+        when(group1.getId()).thenReturn(GROUP1_ID);
         when(group1.getName()).thenReturn("aGroup");
-        when(group2.getId()).thenReturn("42be1324-3529-4ea7-a97d-dab608a4111d");
+        when(group2.getId()).thenReturn(GROUP2_ID);
         when(group2.getName()).thenReturn("anotherGroup");
     }
 
@@ -171,8 +193,8 @@ public class MockHelper {
         when(realm.getSslRequired()).thenReturn(SslRequired.ALL);
         when(realm.getAccessCodeLifespan()).thenReturn(1000);
         when(realm.getAccessTokenLifespan()).thenReturn(2000);
-        when(realm.getRoleById(role.getId())).thenReturn(role);
-        when(realm.getGroupById(group1.getId())).thenReturn(group1);
+        when(realm.getRoleById(ROLE_ID)).thenReturn(role);
+        when(realm.getGroupById(GROUP1_ID)).thenReturn(group1);
     }
 
     public RealmModel getRealm() {
@@ -183,7 +205,7 @@ public class MockHelper {
      * Initialises a keycloak client of unspecified protocol
      */
     private void initClient() {
-        when(client.getId()).thenReturn(UUID.randomUUID().toString()) ;
+        when(client.getId()).thenReturn(CLIENT_ID);
         when(client.getClientId()).thenReturn(getClientId());
         when(client.isEnabled()).thenReturn(true);
     }
@@ -197,12 +219,9 @@ public class MockHelper {
      * Initialises a test user
      */
     private void initUser() {
-        when(user.getId()).thenReturn(getUserId());
+        when(user.getId()).thenReturn(USER_ID);
         when(user.getUsername()).thenReturn("testUser");
         when(user.getEmail()).thenReturn("testUser@test.com");
-    }
-    private String getUserId(){
-        return "e43169e4-82ac-4f7b-a8e3-9806d34c2825";
     }
 
     public UserModel getUser() {
@@ -226,7 +245,7 @@ public class MockHelper {
      * Initialises a "user" role
      */
     private void initRole() {
-        when(role.getId()).thenReturn(UUID.randomUUID().toString());
+        when(role.getId()).thenReturn(ROLE_ID);
         when(role.getName()).thenReturn("user");
         when(role.getContainer()).thenReturn(realm);
     }
@@ -247,7 +266,7 @@ public class MockHelper {
      * Initialises the ResourceServerStore. A ResourceServer is a client which has had the authorization enabled.
      */
     private void initResourceServerStore(){
-        when(resourceServerStore.findById(client.getId())).thenReturn(resourceServer);
+        when(resourceServerStore.findById(CLIENT_ID)).thenReturn(resourceServer);
     }
 
     public ResourceServerStore getResourceServerStore() {
@@ -274,10 +293,12 @@ public class MockHelper {
      * Initialises a Resource of for the authorisation service. This is necessary for the module to work
      */
     private void initResource(){
-        when(resource.getId()).thenReturn(UUID.randomUUID().toString());
+        Set<String> uris = new HashSet<String>();
+        uris.add("");
+        when(resource.getId()).thenReturn(RESOURCE_ID);
         when(resource.getName()).thenReturn("Keycloak Client Resource");
         when(resource.getOwner()).thenReturn(getClientId());
-        when(resource.getUri()).thenReturn("");
+        when(resource.getUris()).thenReturn(uris);
         when(resource.getScopes()).thenReturn(Collections.emptyList());
         when(resource.getType()).thenReturn("urn:" + getClientId() + ":default");
         when(resource.getResourceServer()).thenReturn(resourceServer);
@@ -287,8 +308,25 @@ public class MockHelper {
      * Initialises a PolicyStore
      */
     private void initPolicyStore(){
-        when(policyStore.findByResource(resource.getId(), resourceServer.getId())).thenReturn(Collections.singletonList(parentPolicy));
-        when(policyStore.findByResourceType(resource.getType(), resourceServer.getId())).thenReturn(Collections.singletonList(parentPolicy));
+        Answer<?> answer = invocation -> {
+            String resource = invocation.getArgument(0, String.class);
+            if (!resource.equals(RESOURCE_ID) && !resource.equals(MockHelper.this.resource.getType())) {
+                return null;
+            }
+            String resourceServerId = invocation.getArgument(1, String.class);
+            if (resourceServerId.equals(MockHelper.this.resourceServer.getId())) {
+                @SuppressWarnings("unchecked")
+                Consumer<Policy> consumer = (Consumer<Policy>)invocation.getArgument(2);
+                consumer.accept(parentPolicy);
+            }
+            return null;
+        };
+        Mockito.doAnswer(answer).when(policyStore).findByResource(Mockito.anyString(), Mockito.anyString(), Mockito.any());
+        Mockito.doAnswer(answer).when(policyStore).findByResourceType(Mockito.anyString(), Mockito.anyString(), Mockito.any());
+        //Mockito.doAnswer(answer).when(policyStore).findByResource(Mockito.eq(RESOURCE_ID), Mockito.eq(resourceServer.getId()), Mockito.any());
+        //Mockito.doAnswer(answer).when(policyStore).findByResourceType(Mockito.eq(resource.getType()), Mockito.eq(resourceServer.getId()), Mockito.any());
+        //when(policyStore.findByResource(RESOURCE_ID, resourceServer.getId())).thenReturn(Collections.singletonList(parentPolicy));
+        //when(policyStore.findByResourceType(resource.getType(), resourceServer.getId())).thenReturn(Collections.singletonList(parentPolicy));
     }
 
     /**
@@ -302,13 +340,20 @@ public class MockHelper {
         when(groupPolicy.getLogic()).thenReturn(Logic.POSITIVE);
         Map<String, String> groupPolicyConfig = new HashMap<>();
         groupPolicyConfig.put("groupsClaim","member");
-        String groups = "[{\"id\":\""+ group1.getId() +"\",\"extendChildren\":false}]";
+        String groups = "[{\"id\":\""+ GROUP1_ID +"\",\"extendChildren\":false}]";
         groupPolicyConfig.put("groups", groups);
-        when(groupPolicy.getConfig()).thenReturn(groupPolicyConfig);
+        //when(groupPolicy.getConfig()).thenReturn(groupPolicyConfig);
+        when(groupPolicy.getConfig()).then(i -> {
+            return groupPolicyConfig;
+        });
 
         when(userPolicy.getType()).thenReturn("user");
         when(userPolicy.getLogic()).thenReturn(Logic.NEGATIVE);
-        when(userPolicy.getConfig()).thenReturn(Collections.singletonMap("users", JsonSerialization.writeValueAsString(Collections.singleton(getUserId()))));
+        //when(userPolicy.getConfig()).thenReturn(Collections.singletonMap("users", JsonSerialization.writeValueAsString(Collections.singleton(USER_ID))));
+        final Map<String, String> userPolicyConfig = Collections.singletonMap("users", JsonSerialization.writeValueAsString(Collections.singleton(USER_ID)));
+        when(userPolicy.getConfig()).then(i -> {
+            return userPolicyConfig;
+        });
     }
 
     public Policy getUserPolicy() {
@@ -320,6 +365,14 @@ public class MockHelper {
     public void setPolicy(Policy policy) {
         when(parentPolicy.getAssociatedPolicies()).thenReturn(Collections.singleton(policy));
         when(parentPolicy.getDecisionStrategy()).thenReturn(DecisionStrategy.UNANIMOUS);
+        String policyType = policy.getType();
+        when(parentPolicy.getType()).thenReturn(policyType);
+        Map<String, String> config = policy.getConfig();
+		when(parentPolicy.getConfig()).thenReturn(config);
+    }
+
+    public PolicyEvaluator getPolicyEvaluator() {
+        return policyEvaluator;
     }
 
     /**
@@ -337,12 +390,18 @@ public class MockHelper {
         when (session.getProvider(LoginFormsProvider.class)).thenReturn(loginFormsProvider);
         when(session.keys()).thenReturn(keyManager);
 
+        @SuppressWarnings("rawtypes")
         Map<String, PolicyProviderFactory> polFactoMap = new HashMap<>();
         polFactoMap.put("user", new UserPolicyProviderFactory());
         polFactoMap.put("group", new GroupPolicyProviderFactory());
-        AuthorizationProvider authorizationProvider = new AuthorizationProvider(session, realm, polFactoMap);
+        AuthorizationProvider authorizationProvider = new AuthorizationProvider(session, realm, polFactoMap, getPolicyEvaluator());
         when(session.getProvider(AuthorizationProvider.class)).thenReturn(authorizationProvider);
         when(session.getKeycloakSessionFactory()).thenReturn(sessionFactory);
+
+        UserSessionProvider usp = Mockito.mock(UserSessionProvider.class);
+        when(session.sessions()).thenReturn(usp);
+        when(usp.getUserSession(Mockito.eq(realm), Mockito.anyString())).thenReturn(userSession);
+        when(userSession.getUser()).thenReturn(user);
     }
 
     public KeycloakSession getSession() {
@@ -350,15 +409,25 @@ public class MockHelper {
     }
 
     /**
-     * Initialises the user session, representing the current session of the user, which may span multiple clients
+     * Initializes the authentication session
+     */
+    private void initAuthenticationSession() {
+    }
+
+    public AuthenticationSessionModel getAuthenticationSession() {
+        return authenticationSession;
+    }
+
+    /**
+     * Initializes the user session, representing the current session of the user, which may span multiple clients
      */
     private void initUserSession() {
-        when(userSession.getId()).thenReturn(UUID.randomUUID().toString());
-        when(userSession.getBrokerSessionId()).thenReturn(UUID.randomUUID().toString());
+        when(userSession.getId()).thenReturn(USER_SESSION_ID);
+        when(userSession.getBrokerSessionId()).thenReturn(BROKER_SESSION_ID);
         when(userSession.getUser()).thenReturn(user);
-        Map<String, AuthenticatedClientSessionModel> map = Collections.singletonMap(client.getId(), clientSession);
-        when(userSession.getAuthenticatedClientSessions()).thenReturn(map);
-        doReturn(user.getId()).when(userSession).getBrokerUserId();
+        //Map<String, AuthenticatedClientSessionModel> map = Collections.singletonMap(CLIENT_ID, clientSession);
+        //when(userSession.getAuthenticatedClientSessions()).thenReturn(map);
+        when(userSession.getBrokerUserId()).thenReturn(USER_ID);
         when(userSession.isOffline()).thenReturn(true);
 
     }
@@ -368,16 +437,29 @@ public class MockHelper {
     }
 
     /**
-     * Initialises the client session, representing the current state of the client, which may span multiple users.
+     * Initializes the client session context
+     */
+    private void initClientSessionContext() {
+        when(clientSessionCtx.getClientSession()).thenReturn(clientSession);
+        when(clientSessionCtx.getAttribute(OIDCLoginProtocol.NONCE_PARAM, String.class)).thenReturn("nonce");
+        when(clientSessionCtx.getScopeString()).thenReturn("scope");
+    }
+
+    public ClientSessionContext getClientSessionContext() {
+        return clientSessionCtx;
+    }
+
+    /**
+     * Initializes the client session, representing the current state of the client, which may span multiple users.
      * Here we use the AuthenticatedClientSessionModel
      */
     private void initClientSession() {
-        when(clientSession.getId()).thenReturn(UUID.randomUUID().toString());
+        when(clientSession.getId()).thenReturn(CLIENT_SESSION_ID);
         when(clientSession.getClient()).thenReturn(client);
         when(clientSession.getRedirectUri()).thenReturn(getClientId());
         when(clientSession.getNote("SSO_AUTH")).thenReturn("true");
-        String roleId = role.getId();
-        when(clientSession.getRoles()).thenReturn(Collections.singleton(roleId));
+        when(clientSession.getNote(OIDCLoginProtocol.ISSUER)).thenReturn("issuer");
+        //when(clientSession.getRoles()).thenReturn(Collections.singleton(ROLE_ID));
         when(clientSession.getUserSession()).thenReturn(userSession);
         when(clientSession.getRealm()).thenReturn(realm);
     }
@@ -391,7 +473,8 @@ public class MockHelper {
         oidcGroupMapper.setId(oidcGroupMapper.getName());
         when(sessionFactory.getProviderFactory(ProtocolMapper.class, oidcGroupMapper.getProtocolMapper())).thenReturn(new org.keycloak.protocol.oidc.mappers.GroupMembershipMapper());
         when(client.getProtocolMapperById(oidcGroupMapper.getId())).thenReturn(oidcGroupMapper);
-        when(clientSession.getProtocolMappers()).thenReturn(Collections.singleton(oidcGroupMapper.getName()));
+        //when(clientSession.getProtocolMappers()).thenReturn(Collections.singleton(oidcGroupMapper.getName()));
+        //when(clientSession.getProtocol()).thenReturn(oidcGroupMapper.getName());
     }
 
     public void enableWsfedGroupMapper(){
@@ -399,7 +482,8 @@ public class MockHelper {
         wsfedGroupMapper.setId(wsfedGroupMapper.getName());
         when(sessionFactory.getProviderFactory(ProtocolMapper.class, wsfedGroupMapper.getProtocolMapper())).thenReturn(new SAMLGroupMembershipMapper());
         when(client.getProtocolMapperById(wsfedGroupMapper.getId())).thenReturn(wsfedGroupMapper);
-        when(clientSession.getProtocolMappers()).thenReturn(Collections.singleton(wsfedGroupMapper.getName()));
+        //when(clientSession.getProtocolMappers()).thenReturn(Collections.singleton(wsfedGroupMapper.getName()));
+        //when(clientSession.getProtocol()).thenReturn(wsfedGroupMapper.getName());
     }
 
     public void enableSamlGroupMapper(){
@@ -407,7 +491,8 @@ public class MockHelper {
         samlGroupMapper.setId(samlGroupMapper.getName());
         when(sessionFactory.getProviderFactory(ProtocolMapper.class, samlGroupMapper.getProtocolMapper())).thenReturn(new org.keycloak.protocol.saml.mappers.GroupMembershipMapper());
         when(client.getProtocolMapperById(samlGroupMapper.getId())).thenReturn(samlGroupMapper);
-        when(clientSession.getProtocolMappers()).thenReturn(Collections.singleton(samlGroupMapper.getName()));
+        //when(clientSession.getProtocolMappers()).thenReturn(Collections.singleton(samlGroupMapper.getName()));
+        //when(clientSession.getProtocol()).thenReturn(samlGroupMapper.getName());
     }
 
     /**
@@ -450,20 +535,13 @@ public class MockHelper {
             throw new RuntimeException(e);
         }
 
-        SecretKey secret = new SecretKeySpec("junit".getBytes(), "HmacSHA256");
-        MessageDigest sha;
-        try {
-            sha = MessageDigest.getInstance("SHA-1");
-        } catch (NoSuchAlgorithmException e) {
-            throw new RuntimeException("This shouldn't happen");
-        }
-
-        SecretKeySpec secretKeySpec = new SecretKeySpec(Arrays.copyOf(sha.digest(("junit").getBytes()), 16), "AES");
-        KeyManager.ActiveHmacKey activeHmacKey = new KeyManager.ActiveHmacKey(UUID.randomUUID().toString(), secret);
-        KeyManager.ActiveRsaKey activeRsaKey = new KeyManager.ActiveRsaKey(UUID.randomUUID().toString(), keyPair.getPrivate(), keyPair.getPublic(), certificate);
-        KeyManager.ActiveAesKey activeAesKey = new KeyManager.ActiveAesKey(UUID.randomUUID().toString(), secretKeySpec);
-        when(keyManager.getActiveHmacKey(realm)).thenReturn(activeHmacKey);
-        when(keyManager.getActiveRsaKey(realm)).thenReturn(activeRsaKey);
-        when(keyManager.getActiveAesKey(realm)).thenReturn(activeAesKey);
+        KeyWrapper activeKeyWrapper = new KeyWrapper();
+        activeKeyWrapper.setVerifyKey(keyPair.getPublic());
+        activeKeyWrapper.setAlgorithm("RS256");
+        activeKeyWrapper.setCertificate(certificate);
+        activeKeyWrapper.setKid(KID_UUID);
+        activeKeyWrapper.setSignKey(keyPair.getPrivate());
+        activeKeyWrapper.setStatus(KeyStatus.ACTIVE);
+        when(keyManager.getActiveKey(Mockito.eq(realm), any(), Mockito.eq(Algorithm.RS256))).thenReturn(activeKeyWrapper);
     }
 }
